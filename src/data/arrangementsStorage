@@ -1,0 +1,44 @@
+// src/data/arrangementsStorage.ts
+import {  } from "@/types/arrangement";
+
+const ARRANGEMENTS_KEY = "arkme-demo.arrangements.v3";
+const SCHEMA_VERSION = 1;
+
+function safeParse(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+export function readArrangementsStorage() {
+  if (typeof window === "undefined") return { arrangements: [], proposed: [] };
+  const raw = window.localStorage.getItem(ARRANGEMENTS_KEY);
+  const parsed = safeParse(raw);
+
+  if (!parsed || parsed.version !== SCHEMA_VERSION) {
+    const fallback = { arrangements: [], proposed: [] };
+    writeArrangementsStorage(fallback.arrangements, fallback.proposed);
+    return fallback;
+  }
+
+  return {
+    arrangements: parsed.arrangements ?? [],
+    proposed: parsed.proposed ?? []
+  };
+}
+
+export function writeArrangementsStorage(arrangements, proposed) {
+  if (typeof window === "undefined") return;
+  const payload = {
+    version: SCHEMA_VERSION,
+    arrangements,
+    proposed
+  };
+
+  try {
+    window.localStorage.setItem(ARRANGEMENTS_KEY, JSON.stringify(payload));
+  } catch {}
+}

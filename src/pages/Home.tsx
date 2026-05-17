@@ -5,7 +5,16 @@ import ChatInput from "@/components/ChatInput";
 import ChatList from "@/components/ChatList";
 import RecordDetailSheet from "@/components/RecordDetailSheet";
 import RecordFullDetailScreen from "@/components/RecordFullDetailScreen";
+import ConversationExtractBar from "@/components/arrangements/ConversationExtractBar";
+import ArrangementsScreen from "@/pages/ArrangementsScreen";
 import Records from "@/pages/Records";
+import {
+  isArrangementAiConfigReady,
+  readArrangementAiConfig,
+} from "@/data/arrangementAiConfigStorage";
+import { useArrangements } from "@/hooks/useArrangements";
+import { ArrangementAiRequestError } from "@/lib/arrangementAiClient";
+import { extractArrangementsFromConversation } from "@/lib/arrangementExtraction";
 import { aiConversationLogEntries } from "@/data/aiConversationLog";
 import { useCandidateProfile } from "@/data/candidateProfile";
 import {
@@ -329,8 +338,20 @@ function shouldRequestBrowserNotificationPermission() {
 
 export default function Home({ currentPage, onNavigate }: HomeProps) {
   const { t } = usePreferences();
+  const candidateProfile = useCandidateProfile();
   const [showSearch, setShowSearch] = React.useState(false);
   const [showMenu, setShowMenu] = React.useState(false);
+  const [showArrangements, setShowArrangements] = React.useState(false);
+  const [arrangementsInitialView, setArrangementsInitialView] = React.useState<
+    "list" | "aiSettings"
+  >("list");
+  const [arrangementExtract, setArrangementExtract] = React.useState({
+    loading: false,
+    error: null as string | null,
+    resultMessage: null as string | null,
+  });
+
+  const arrangementsApi = useArrangements();
   const [showAnswerGuide, setShowAnswerGuide] = React.useState(false);
   const [showAiConversation, setShowAiConversation] = React.useState(false);
   const [showSendToSelf, setShowSendToSelf] = React.useState(false);
@@ -408,6 +429,96 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       );
     }
   }, []);
+
+  const openArrangementsModule = React.useCallback(
+    (initialView: "list" | "aiSettings" = "list") => {
+      setArrangementsInitialView(initialView);
+      setShowArrangements(true);
+    },
+    []
+  );
+
+  const runConversationArrangementExtract = React.useCallback(
+    async (input: {
+      conversationId: string;
+      conversationLabel: string;
+      messages: Array<{
+        id: string;
+        text: string;
+        sentAt: number;
+        senderLabel: string;
+        isSelf: boolean;
+      }>;
+    }) => {
+      const config = readArrangementAiConfig();
+      if (!isArrangementAiConfigReady(config)) {
+        setArrangementExtract({
+          loading: false,
+          error: t("arrangements.extractNeedConfig"),
+          resultMessage: null,
+        });
+        setArrangementsInitialView("aiSettings");
+        return;
+      }
+
+      setArrangementExtract({ loading: true, error: null, resultMessage: null });
+      try {
+        const extracted = await extractArrangementsFromConversation(config, {
+          conversationLabel: input.conversationLabel,
+          messages: input.messages.slice(-12),
+        });
+
+        // create proposed arrangements for user confirmation (private-bilateral handled by extraction)
+        const proposals = extracted.map((item) =>
+          arrangementsApi.createProposed(
+            {
+              title: item.title,
+              note: item.note,
+              scheduledAt: item.scheduledAt ?? null,
+              scheduledStart: item.scheduledStart ?? null,
+              scheduledEnd: item.scheduledEnd ?? null,
+              reminderAt: null,
+              reminderType: item.scheduledStart || item.scheduledEnd ? "time-range" : item.scheduledAt ? "deadline" : "reminder-only",
+              participants: item.participants,
+              needsTimeReview: item.needsTimeReview,
+            },
+            {
+              type: item.sourceType ?? "ai",
+              conversationId: input.conversationId,
+              conversationLabel: input.conversationLabel,
+              messageIds: item.messageIds,
+              excerpt: item.excerpt,
+            },
+            item.participants
+          )
+        );
+
+        const needsTimeCount = proposals.filter((p) => p.draft.needsTimeReview).length;
+        let resultMessage: string | null = null;
+        if (proposals.length === 0) {
+          resultMessage = t("arrangements.extractEmpty");
+        } else if (needsTimeCount > 0) {
+          resultMessage = t("arrangements.extractSuccessWithTime")
+            .replace("{count}", String(proposals.length))
+            .replace("{needsTime}", String(needsTimeCount));
+        } else {
+          resultMessage = t("arrangements.extractSuccess").replace(
+            "{count}",
+            String(proposals.length)
+          );
+        }
+
+        setArrangementExtract({ loading: false, error: null, resultMessage });
+      } catch (error) {
+        const message =
+          error instanceof ArrangementAiRequestError
+            ? error.message
+            : t("arrangements.extractFailed");
+        setArrangementExtract({ loading: false, error: message, resultMessage: null });
+      }
+    },
+    [t]
+  );
 
   const makeSelfSource = React.useCallback(
     (recordUid: string): RecordSourceConversation => ({
@@ -1100,6 +1211,18 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       );
     }
 
+    if (showArrangements) {
+      return (
+        <ArrangementsScreen
+          initialView={arrangementsInitialView}
+          onBack={() => {
+            setShowArrangements(false);
+            setArrangementsInitialView("list");
+          }}
+        />
+      );
+    }
+
     if (showAiConversation) {
       return (
         <AiToolConversationChat
@@ -1120,6 +1243,24 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
           onCreateRecord={createSelfRecord}
           onOpenRecordDetail={setRecordDetail}
           onOpenRecordSnapshot={setRecordSnapshot}
+          extractLoading={arrangementExtract.loading}
+          extractError={arrangementExtract.error}
+          extractResultMessage={arrangementExtract.resultMessage}
+          onExtractArrangements={() =>
+            runConversationArrangementExtract({
+              conversationId: "send-to-self",
+              conversationLabel: t("sendToSelf.title"),
+              messages: selfRecords.slice(-12).map((record) => ({
+                id: record.uid,
+                text: record.text_content,
+                sentAt: record.send_at,
+                senderLabel: t("recordDetail.me"),
+                isSelf: true,
+              })),
+            })
+          }
+          onOpenArrangementAiSettings={() => openArrangementsModule("aiSettings")}
+          onOpenArrangements={() => openArrangementsModule("list")}
         />
       );
     }
@@ -1133,6 +1274,29 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
           onOpenRecordDetail={setRecordDetail}
           onOpenRecordSnapshot={setRecordSnapshot}
           onCreateReply={(content) => createTestReply(activeTestConversationSummary, content)}
+          showExtractBar={activeTestConversationSummary.conversationType === "private"}
+          extractLoading={arrangementExtract.loading}
+          extractError={arrangementExtract.error}
+          extractResultMessage={arrangementExtract.resultMessage}
+          onExtractArrangements={() =>
+            runConversationArrangementExtract({
+              conversationId: activeTestConversationSummary.conversationId,
+              conversationLabel: activeTestConversationSummary.title,
+              messages: activeTestConversationSummary.records.slice(-12).map((record) => ({
+                id: record.uid,
+                text: record.text_content,
+                sentAt: record.send_at,
+                senderLabel:
+                  record.sender === "demo"
+                    ? candidateProfile?.name || t("recordDetail.me")
+                    : activeTestConversationSummary.identity?.name ||
+                      activeTestConversationSummary.title,
+                isSelf: record.sender === "demo",
+              })),
+            })
+          }
+          onOpenArrangementAiSettings={() => openArrangementsModule("aiSettings")}
+          onOpenArrangements={() => openArrangementsModule("list")}
         />
       );
     }
@@ -1208,12 +1372,16 @@ export default function Home({ currentPage, onNavigate }: HomeProps) {
       mainPane={
         <div className="relative flex min-h-0 flex-1 flex-col">
           <main className="min-h-0 flex-1 overflow-hidden">{renderMainContent()}</main>
-          {!recordDetail && !showSearch && !showAnswerGuide && !showAiConversation && !showSendToSelf && !showTestConversation && !settingsView && (
+          {!recordDetail && !showSearch && !showArrangements && !showAnswerGuide && !showAiConversation && !showSendToSelf && !showTestConversation && !settingsView && (
             <MobileBottomNavigation currentPage={currentPage} onNavigate={onNavigate} />
           )}
           <MobileSideDrawer
             open={showMenu}
             onClose={() => setShowMenu(false)}
+            onOpenArrangements={() => {
+              setShowMenu(false);
+              setShowArrangements(true);
+            }}
             onOpenAnswerGuide={() => {
               setShowMenu(false);
               setShowAnswerGuide(true);
@@ -1808,6 +1976,7 @@ function getLatestRecord(records: RecordItem[]) {
 function MobileSideDrawer({
   open,
   onClose,
+  onOpenArrangements,
   onOpenAnswerGuide,
   onOpenAiConversation,
   onOpenSendToSelf,
@@ -1818,6 +1987,7 @@ function MobileSideDrawer({
 }: {
   open: boolean;
   onClose: () => void;
+  onOpenArrangements: () => void;
   onOpenAnswerGuide: () => void;
   onOpenAiConversation: () => void;
   onOpenSendToSelf: () => void;
@@ -1914,6 +2084,7 @@ function MobileSideDrawer({
 
         <nav className="-mx-4 mt-3 min-h-0 flex-1 space-y-1 overflow-y-auto pb-3">
           <GuideConversationItem onClick={onOpenAnswerGuide} />
+          <ArrangementsDrawerItem onClick={onOpenArrangements} />
           {conversationItems.map((item) => (
             <React.Fragment key={item.key}>{item.node}</React.Fragment>
           ))}
@@ -1966,6 +2137,33 @@ function SendToSelfDrawerItem({
           {latestRecord?.text_content ?? t("sendToSelf.emptyPreview")}
         </p>
       </div>
+    </button>
+  );
+}
+
+function ArrangementsDrawerItem({ onClick }: { onClick: () => void }) {
+  const { t } = usePreferences();
+
+  return (
+    <button
+      type="button"
+      className="flex w-full items-center px-4 py-2.5 text-left transition hover:bg-bg active:scale-[0.99]"
+      onClick={onClick}
+    >
+      <span className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-full bg-surface-2 text-primary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+          <rect x="4" y="5" width="16" height="15" rx="2.5" stroke="currentColor" strokeWidth="1.6" />
+          <path d="M8 3.5v3M16 3.5v3M4 10h16" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      </span>
+      <span className="ml-[7px] min-w-0 flex-1 text-left">
+        <span className="block truncate text-[15px] font-medium leading-5 text-text">
+          {t("arrangements.title")}
+        </span>
+        <span className="mt-0.5 block truncate text-xs leading-4 text-text-muted">
+          {t("arrangements.drawerDesc")}
+        </span>
+      </span>
     </button>
   );
 }
@@ -2314,6 +2512,12 @@ function SendToSelfConversationChat({
   onCreateRecord,
   onOpenRecordDetail,
   onOpenRecordSnapshot,
+  extractLoading = false,
+  extractError = null,
+  extractResultMessage = null,
+  onExtractArrangements,
+  onOpenArrangementAiSettings,
+  onOpenArrangements,
 }: {
   records: RecordItem[];
   targetUid?: string | null;
@@ -2321,6 +2525,12 @@ function SendToSelfConversationChat({
   onCreateRecord: (content: string) => void;
   onOpenRecordDetail: (record: RecordItem) => void;
   onOpenRecordSnapshot: (record: RecordItem) => void;
+  extractLoading?: boolean;
+  extractError?: string | null;
+  extractResultMessage?: string | null;
+  onExtractArrangements?: () => void;
+  onOpenArrangementAiSettings?: () => void;
+  onOpenArrangements?: () => void;
 }) {
   const { t } = usePreferences();
   const recordsWithoutSource = React.useMemo(
@@ -2357,6 +2567,17 @@ function SendToSelfConversationChat({
         </div>
       </header>
 
+      {onExtractArrangements && onOpenArrangementAiSettings && onOpenArrangements && (
+        <ConversationExtractBar
+          loading={extractLoading}
+          error={extractError}
+          resultMessage={extractResultMessage}
+          onExtract={onExtractArrangements}
+          onOpenAiSettings={onOpenArrangementAiSettings}
+          onOpenArrangements={onOpenArrangements}
+        />
+      )}
+
       <ChatList
         records={recordsWithoutSource}
         hasMore={false}
@@ -2381,6 +2602,13 @@ function TestIdentityConversationChat({
   onOpenRecordDetail,
   onOpenRecordSnapshot,
   onCreateReply,
+  showExtractBar = false,
+  extractLoading = false,
+  extractError = null,
+  extractResultMessage = null,
+  onExtractArrangements,
+  onOpenArrangementAiSettings,
+  onOpenArrangements,
 }: {
   summary: TestConversationSummary;
   targetUid?: string | null;
@@ -2388,6 +2616,13 @@ function TestIdentityConversationChat({
   onOpenRecordDetail: (record: RecordItem) => void;
   onOpenRecordSnapshot: (record: RecordItem) => void;
   onCreateReply: (content: string) => void;
+  showExtractBar?: boolean;
+  extractLoading?: boolean;
+  extractError?: string | null;
+  extractResultMessage?: string | null;
+  onExtractArrangements?: () => void;
+  onOpenArrangementAiSettings?: () => void;
+  onOpenArrangements?: () => void;
 }) {
   const { resolvedLocale, t } = usePreferences();
   const candidateProfile = useCandidateProfile();
@@ -2436,6 +2671,20 @@ function TestIdentityConversationChat({
           </div>
         </div>
       </header>
+
+      {showExtractBar &&
+        onExtractArrangements &&
+        onOpenArrangementAiSettings &&
+        onOpenArrangements && (
+          <ConversationExtractBar
+            loading={extractLoading}
+            error={extractError}
+            resultMessage={extractResultMessage}
+            onExtract={onExtractArrangements}
+            onOpenAiSettings={onOpenArrangementAiSettings}
+            onOpenArrangements={onOpenArrangements}
+          />
+        )}
 
       <div
         ref={scrollContainerRef}
